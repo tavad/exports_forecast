@@ -1,0 +1,255 @@
+----
+title: "EAEU forecast"
+author: "Aghasi Tavadyan"
+date: '2022-07-23'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries}
+library(tidyverse)
+library(tidymodels)
+library(scales)
+library(readxl)
+library(comtradr)
+library(lubridate)
+library(RcppRoll)
+library(zoo)
+library(tidytext)
+library(ggthemes)
+
+theme_set(ggthemes::theme_clean())
+doParallel::registerDoParallel(cores = 8)
+```
+
+```{r downloading_and_cleaning_data}
+
+period <- crossing(year = 2010:2022, month = 1:12) %>% 
+  mutate(month = formatC(month, width = 2, flag = "0"),
+         period = paste0(year, "-", month)) %>% 
+  pull(period)
+
+period_begin <- period[c(T, F, F, F)]
+period_end <- period[c(F, F, F, T)]
+
+EAEU <- c("Russian Federation", "Kazakhstan", "Belarus", "Armenia", "Kyrgyzstan")
+
+zero_cols <- c("reporter_iso", "partner_iso", "x2nd_partner_code", "x2nd_partner",
+               "x2nd_partner_iso", "customs_proc_code", "customs", "mode_of_transport_code",
+               "mode_of_transport", "qty_unit_code", "qty_unit", "alt_qty_unit_code",
+               "alt_qty_unit", "gross_weight_kg", "qty", "alt_qty", "cif_trade_value_us",
+               "fob_trade_value_us", "flag", "partners_region", "commodity_type", "x5_6", "x3_4", "x1_2",
+               "classification", "aggregate_level", "is_leaf_code", "trade_flow_code",
+               "second_partner_code", "second_partner", "commodity", "netweight_kg")
+
+s
+
+database = NULL
+
+for (i in 1:length(period)) {
+temp <- comtradr::ct_search(reporters = EAEU, partners = "ALL",
+                            trade_direction = c("exports", "imports"), freq = "monthly",
+                            start_date = period_begin[i], end_date = period_end[i],
+                            commod_codes = "TOTAL", type = "goods") %>% 
+  janitor::clean_names() %>% 
+  as_tibble() %>% 
+  select(!contains(zero_cols)) %>% 
+  mutate(year = as.numeric(year),
+         period = as.numeric(period),
+         period_desc = as.character(period_desc),
+         reporter = as.character(reporter),
+         reporter_code = as.numeric(reporter_code),
+         trade_flow = as.character(trade_flow),
+         partner_code = as.character(partner_code),
+         partner = as.character(partner),
+         trade_value_usd  = as.numeric(trade_value_usd)
+         )
+  
+  database <- bind_rows(database, temp)
+}
+
+comtradr::ct_get_remaining_hourly_queries()
+```
+
+
+```{r test_of_data_complition}
+database %>% 
+  mutate(period = ym(period)) %>% 
+  count(period) %>%
+  mutate(difference = period - lag(period)) %>%
+  # view()
+  filter(difference > 31)
+```
+
+
+```{r final_dataset}
+data_EAEU <- database %>% 
+  mutate(period = ym(period)) %>% 
+  filter(year >= 2015) %>%  
+  mutate(partner_region = case_when(
+    partner %in% EAEU ~ "EAEU",
+    partner == "World" ~ "World"
+  )) %>%  
+  filter(!is.na(partner_region)) %>% 
+  select(-c(period_desc, reporter_code,
+            partner_code, partner, year)) %>% 
+  group_by(trade_flow, reporter, partner_region, period) %>% 
+  summarise(trade_value_usd = sum(trade_value_usd),
+            .groups = "drop")
+```
+
+```{r test_plot}
+i = 1
+
+trades = c("Exports", "Imports")
+
+data_EAEU %>% 
+  filter(trade_flow == trades[i]) %>% 
+  ggplot(aes(period, trade_value_usd/1e6, color = partner_region)) +
+  geom_line(size = 1.5) +
+  facet_wrap(~ reporter, scales = "free_y") +
+  scale_y_continuous(labels = dollar_format()) +
+  scale_x_date(date_labels = "%Y", date_breaks = "1 year") +
+  scale_color_viridis_d() +
+  labs(x = "",
+       y = "Million USD",
+       title = "Exports of EAEU countries to World and other countries of the Union") +
+  theme(legend.position = "bottom",
+        legend.title = element_blank())
+    
+```
+
+
+
+```{r predictions}
+library(sweep)
+library(timetk)
+library(forecast)
+library(zoo)
+
+data_EAEU_ts <- data_EAEU %>% 
+  nest(data = c(period, trade_value_usd)) %>% 
+  mutate(ts = map(data, tk_ts, start = 2015, freq = 12))
+
+data_EAEU_ets <- data_EAEU_ts %>%
+  mutate(model = map(ts, ets))
+ 
+data_EAEU_forecasts <- data_EAEU_ets %>%
+  crossing(model_name = c("auto.arima", "ets")) %>%
+  mutate(model = map2(model_name, ts, ~ invoke(.x, list(.y))),
+         forecast = map(model, forecast, h = 48, level = c(50, 80, 95))) %>%
+  mutate(sweep = map(forecast, sw_sweep)) %>% 
+  unnest(sweep)
+
+data_EAEU_forecasts %>% saveRDS("Database_forecast.RDS")
+
+```
+
+```{r}
+
+data_EAEU_forecasts <- readRDS("Database_forecast.RDS")
+
+data_EAEU_forecasts_clean <- data_EAEU_forecasts %>% 
+  select(-data, -ts, -model, -forecast) %>%
+  mutate(across(contains(c("lo.", "hi.")), ~ if_else(.x <= 0, 0, .x))) %>% 
+  mutate(index = as.Date(as.yearmon(index), frac = 1))
+
+forecast_first_rows <- data_EAEU_forecasts_clean %>%  
+  group_by(reporter) %>% 
+  filter(key == "actual") %>% 
+  filter(index == max(index)) %>% 
+  mutate(key = "forecast") %>% 
+  mutate(across(contains(c("hi.", "lo.")), ~ trade_value_usd)) %>% 
+  ungroup()
+
+data_EAEU_forecast_final <- data_EAEU_forecasts_clean %>% 
+  bind_rows(forecast_first_rows) %>% 
+  mutate(forecast = ifelse(key == "actual", "Actual Data", str_to_upper(model_name))) %>% 
+  select(-key, -model_name)
+
+data_EAEU_forecast_final %>%  count(forecast)
+    
+```
+
+
+```{r}
+EAEU_ru <- c("Российская Федерация", "Казахстан", "Беларусь", "Армения", "Киргизия")
+EAEU = c("Russian Federation", "Kazakhstan", "Belarus", "Armenia", "Kyrgyzstan")
+
+ru_names <- tibble(en = EAEU, ru = EAEU_ru)
+
+
+data_EAEU_ru <- data_EAEU_forecast_final %>%
+  left_join(ru_names, by = c("reporter" = "en")) %>% 
+  select(-reporter) %>% 
+  rename(reporter = ru) %>% 
+  mutate(forecast = case_when(
+    forecast == "Actual Data" ~ "Фактические данные",
+    TRUE ~ paste0("Прогноз ", forecast)
+  )) %>% 
+  mutate(forecast = fct_inorder(forecast))
+
+data_EAEU_ru %>%  count(forecast)
+```
+
+
+```{r final_plot_function}
+EAEU_forecast_plot <- function(
+    data,
+    flow = c("Exports", "Imports"),
+    region = c("World", "EAEU")
+){
+  title_full = paste0("Прогноз ",
+                      ifelse(region == "World", "общего ", ""),
+                      ifelse(flow == "Exports", "экспорта", "импорта"),
+                      " государства-члена ЕАЭС",
+                      ifelse(region == "World", "", " в другие страны Союза")
+  )
+  
+  data %>%
+    filter(trade_flow == flow) %>% 
+    filter(
+      # !c(reporter == "Kyrgyzstan" & forecast == "ETS"),
+      partner_region == region
+    ) %>% 
+    ggplot(aes(index, trade_value_usd / 1e6, color = forecast, lty = forecast)) +
+    geom_line(size = 0.75) +
+    geom_ribbon(aes(ymin = lo.50 / 1e6, ymax = hi.50 / 1e6), alpha = .5) +
+    facet_wrap(~ reporter, scales = "free_y") +
+    expand_limits(y = 0) +
+    scale_y_continuous(labels = dollar_format()) +
+    scale_x_date(date_labels = "%Y", date_breaks = "1 year") +
+    scale_color_manual(values = c("#0868ac", "#0868ac", "#43a2ca")) +
+    scale_linetype_manual(values = c(1, 2, 3)) +
+    labs(x = "",
+         y = "Доллар США (миллион)",
+         title = title_full,
+    ) +
+    theme_clean() +
+    theme(legend.position = "bottom",
+          plot.title = element_text(size = 20),
+          plot.subtitle = element_text(size = 14),
+          strip.text.x = element_text(size = 14),
+          axis.title.y = element_text(size = 12),
+          axis.title.x = element_text(size = 12),
+          text = element_text(size = 12),
+          axis.text = element_text(size = 10),
+          legend.text = element_text(size = 10),
+          legend.title = element_blank()
+    )
+}
+```
+
+```{r forecast_plots}
+EAEU_forecast_plot(data_EAEU_ru, "Exports", "World")
+EAEU_forecast_plot(data_EAEU_ru, "Exports", "EAEU")
+EAEU_forecast_plot(data_EAEU_ru, "Imports", "World")
+EAEU_forecast_plot(data_EAEU_ru, "Imports", "EAEU")
+
+```
+
+
+
